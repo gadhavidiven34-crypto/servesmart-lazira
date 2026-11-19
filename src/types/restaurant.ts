@@ -38,6 +38,8 @@ export interface Order {
   readyAt: number | null;
   paidAt: number | null;
   reviewId: string | null;
+  razorpayOrderId?: string | null;
+  razorpayPaymentId?: string | null;
 }
 
 export interface Review {

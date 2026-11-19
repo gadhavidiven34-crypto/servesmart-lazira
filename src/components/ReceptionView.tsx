@@ -268,7 +268,7 @@ export function ReceptionView({
                         {order.paymentMethod === 'upi' ? (
                           <span className="inline-flex items-center gap-1 text-xs font-semibold text-[#101828]">
                             <Smartphone className="w-3.5 h-3.5 text-emerald-700" />
-                            UPI
+                            {order.razorpayPaymentId ? 'Razorpay UPI' : 'UPI'}
                           </span>
                         ) : order.paymentMethod === 'cash' ? (
                           <span className="inline-flex items-center gap-1 text-xs font-semibold text-[#101828]">
@@ -296,6 +296,15 @@ export function ReceptionView({
                           <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-red-50 border border-red-200 text-xs font-bold text-red-700">
                             <AlertCircle className="w-3.5 h-3.5" />
                             Unpaid
+                          </span>
+                        )}
+
+                        {order.razorpayPaymentId && (
+                          <span
+                            data-testid="reception-razorpay-id"
+                            className="font-mono text-[11px] text-emerald-800 bg-emerald-50/70 px-1.5 py-0.5 rounded"
+                          >
+                            {order.razorpayPaymentId}
                           </span>
                         )}
                       </div>
@@ -373,10 +382,22 @@ export function ReceptionView({
 
                         <td className="py-3.5 px-4 whitespace-nowrap">
                           {order.paymentMethod === 'upi' ? (
-                            <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-[#101828]">
-                              <Smartphone className="w-3.5 h-3.5 text-emerald-700" />
-                              UPI
-                            </span>
+                            <div>
+                              <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-[#101828]">
+                                <Smartphone className="w-3.5 h-3.5 text-emerald-700" />
+                                {order.razorpayPaymentId
+                                  ? 'Razorpay UPI'
+                                  : 'UPI'}
+                              </span>
+                              {order.razorpayPaymentId && (
+                                <span
+                                  data-testid="reception-razorpay-id"
+                                  className="block font-mono text-[11px] text-emerald-800 mt-0.5"
+                                >
+                                  {order.razorpayPaymentId}
+                                </span>
+                              )}
+                            </div>
                           ) : order.paymentMethod === 'cash' ? (
                             <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-[#101828]">
                               <Banknote className="w-3.5 h-3.5 text-amber-700" />

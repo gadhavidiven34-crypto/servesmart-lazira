@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  buildAppUpiUri,
   buildTableQrUrl,
   buildUpiUri,
   calculateCartSummary,
@@ -96,11 +97,24 @@ test('calculateCartSummary computes items, bill total, and max parallel prep tim
   assert.equal(summary.lineItems.length, 2);
 });
 
-test('buildUpiUri constructs exact scannable UPI deep link with default gadhavidiven34@oksbi', () => {
+test('buildAppUpiUri constructs exact Android Intent URLs for GPay, PhonePe, and Paytm with default gadhavidiven34@oksbi', () => {
   assert.equal(DEFAULT_SETTINGS.upiId, 'gadhavidiven34@oksbi');
+  const expectedQuery = 'pa=gadhavidiven34@oksbi&pn=Lazira%20Restaurant&am=150&cu=INR';
+  assert.equal(
+    buildAppUpiUri('gpay', DEFAULT_SETTINGS.upiId, DEFAULT_SETTINGS.restaurantName, 150),
+    `intent://pay?${expectedQuery}#Intent;scheme=upi;package=com.google.android.apps.nbu.paisa.user;end`
+  );
+  assert.equal(
+    buildAppUpiUri('phonepe', DEFAULT_SETTINGS.upiId, DEFAULT_SETTINGS.restaurantName, 150),
+    `intent://pay?${expectedQuery}#Intent;scheme=upi;package=com.phonepe.app;end`
+  );
+  assert.equal(
+    buildAppUpiUri('paytm', DEFAULT_SETTINGS.upiId, DEFAULT_SETTINGS.restaurantName, 150),
+    `intent://pay?${expectedQuery}#Intent;scheme=upi;package=net.one97.paytm;end`
+  );
   assert.equal(
     buildUpiUri(DEFAULT_SETTINGS.upiId, DEFAULT_SETTINGS.restaurantName, 150),
-    'upi://pay?pa=gadhavidiven34@oksbi&pn=Lazira%20Restaurant&am=150&cu=INR'
+    `upi://pay?${expectedQuery}`
   );
 });
 
@@ -342,4 +356,140 @@ test('parseIfStorageChanged skips unchanged or malformed payloads and parses rea
     value: [{ id: 'o1', paymentStatus: 'paid' }],
   });
 });
+
+test('Razorpay /api/create-order creates INR orders in paise with Basic Auth and returns { orderId, amount, currency, keyId }', async () => {
+  const { createRazorpayOrder } = await import('../../api/create-order.js');
+
+  // Missing credentials returns 500
+  const missingCreds = await createRazorpayOrder(
+    { amount: 150, receipt: 'ORD-101' },
+    { keyId: '', keySecret: '' }
+  );
+  assert.equal(missingCreds.status, 500);
+
+  // Invalid amount returns 400
+  const badAmount = await createRazorpayOrder(
+    { amount: 0, receipt: 'ORD-101' },
+    { keyId: 'rzp_test_key', keySecret: 'secret_123' }
+  );
+  assert.equal(badAmount.status, 400);
+
+  // Valid request calls Razorpay Orders API with Basic Auth and paise amount
+  let capturedUrl = '';
+  let capturedInit: { method?: string; headers?: Record<string, string>; body?: string } = {};
+  const mockFetch = async (
+    url: string,
+    init: { method?: string; headers?: Record<string, string>; body?: string }
+  ) => {
+    capturedUrl = url;
+    capturedInit = init;
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        id: 'order_RzpTest123',
+        amount: 15000,
+        currency: 'INR',
+        receipt: 'ORD-101',
+      }),
+    };
+  };
+
+  const created = await createRazorpayOrder(
+    { amount: 150, receipt: 'ORD-101' },
+    {
+      keyId: 'rzp_test_key',
+      keySecret: 'secret_123',
+      fetchImpl: mockFetch as unknown as typeof fetch,
+    }
+  );
+
+  assert.equal(capturedUrl, 'https://api.razorpay.com/v1/orders');
+  assert.equal(capturedInit.method, 'POST');
+  assert.equal(
+    capturedInit.headers?.Authorization,
+    `Basic ${Buffer.from('rzp_test_key:secret_123').toString('base64')}`
+  );
+  assert.deepEqual(JSON.parse(capturedInit.body || '{}'), {
+    amount: 15000,
+    currency: 'INR',
+    receipt: 'ORD-101',
+  });
+  assert.equal(created.status, 200);
+  assert.deepEqual(created.body, {
+    orderId: 'order_RzpTest123',
+    amount: 15000,
+    currency: 'INR',
+    keyId: 'rzp_test_key',
+  });
+});
+
+test('Razorpay /api/verify-payment validates HMAC SHA256 signatures accurately', async () => {
+  const { computeRazorpaySignature, verifyRazorpayHmac } = await import(
+    '../../api/verify-payment.js'
+  );
+
+  const secret = 'test_razorpay_secret_xyz';
+  const orderId = 'order_RzpTest123';
+  const paymentId = 'pay_RzpAutoVerified456';
+  const validSig = computeRazorpaySignature(orderId, paymentId, secret);
+
+  const okRes = verifyRazorpayHmac(
+    {
+      razorpay_order_id: orderId,
+      razorpay_payment_id: paymentId,
+      razorpay_signature: validSig,
+    },
+    secret
+  );
+  assert.equal(okRes.status, 200);
+  assert.equal(okRes.body.verified, true);
+  assert.equal(okRes.body.razorpay_payment_id, paymentId);
+
+  // Tampered signature must fail
+  const badRes = verifyRazorpayHmac(
+    {
+      razorpay_order_id: orderId,
+      razorpay_payment_id: paymentId,
+      razorpay_signature: '0'.repeat(validSig.length),
+    },
+    secret
+  );
+  assert.equal(badRes.status, 400);
+  assert.equal(badRes.body.verified, false);
+
+  // Missing fields must fail with 400
+  const missingRes = verifyRazorpayHmac(
+    { razorpay_order_id: orderId, razorpay_payment_id: '', razorpay_signature: '' },
+    secret
+  );
+  assert.equal(missingRes.status, 400);
+  assert.equal(missingRes.body.verified, false);
+});
+
+test('buildRazorpayCheckoutOptions prioritizes Google Pay, PhonePe, and Paytm UPI apps', async () => {
+  const { buildRazorpayCheckoutOptions } = await import('./razorpay');
+  const opts = buildRazorpayCheckoutOptions({
+    keyId: 'rzp_test_key',
+    orderId: 'order_RzpTest123',
+    amountPaise: 15000,
+    currency: 'INR',
+    restaurantName: 'Lazira Restaurant',
+    orderNumber: 'ORD-101',
+    tableNumber: 2,
+    onSuccess: () => {},
+  });
+
+  assert.equal(opts.key, 'rzp_test_key');
+  assert.equal(opts.order_id, 'order_RzpTest123');
+  assert.equal(opts.amount, 15000);
+  assert.equal(opts.currency, 'INR');
+  assert.equal(opts.name, 'Lazira Restaurant');
+  assert.deepEqual(
+    opts.config?.display.blocks.upi_apps.instruments[0].apps,
+    ['google_pay', 'phonepe', 'paytm']
+  );
+  assert.equal(opts.config?.display.preferences.show_default_blocks, false);
+});
+
 

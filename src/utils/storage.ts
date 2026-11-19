@@ -258,6 +258,8 @@ export function useServeSmartStore() {
         readyAt: null,
         paidAt: null,
         reviewId: null,
+        razorpayOrderId: null,
+        razorpayPaymentId: null,
       };
       const updated = [newOrder, ...current];
       writeJson(STORAGE_KEYS.orders, updated);
@@ -307,21 +309,51 @@ export function useServeSmartStore() {
     []
   );
 
-  const markCashPaid = useCallback((orderId: string) => {
-    const current = readJson(STORAGE_KEYS.orders, [] as Order[]);
-    const now = Date.now();
-    const updated = current.map((o) => {
-      if (o.id !== orderId) return o;
-      return {
-        ...o,
-        paymentMethod: o.paymentMethod ?? 'cash',
-        paymentStatus: 'paid' as const,
-        paidAt: now,
-      };
-    });
-    writeJson(STORAGE_KEYS.orders, updated);
-    setOrdersState(updated);
-  }, []);
+  const markCashPaid = useCallback(
+    (
+      orderId: string,
+      fallbackMethod: Exclude<PaymentMethod, null> = 'cash'
+    ) => {
+      const current = readJson(STORAGE_KEYS.orders, [] as Order[]);
+      const now = Date.now();
+      const updated = current.map((o) => {
+        if (o.id !== orderId) return o;
+        return {
+          ...o,
+          paymentMethod: o.paymentMethod ?? fallbackMethod,
+          paymentStatus: 'paid' as const,
+          paidAt: now,
+        };
+      });
+      writeJson(STORAGE_KEYS.orders, updated);
+      setOrdersState(updated);
+    },
+    []
+  );
+
+  const confirmRazorpayPayment = useCallback(
+    (
+      orderId: string,
+      details: { razorpayOrderId: string; razorpayPaymentId: string }
+    ) => {
+      const current = readJson(STORAGE_KEYS.orders, [] as Order[]);
+      const now = Date.now();
+      const updated = current.map((o) => {
+        if (o.id !== orderId) return o;
+        return {
+          ...o,
+          paymentMethod: 'upi' as const,
+          paymentStatus: 'paid' as const,
+          paidAt: now,
+          razorpayOrderId: details.razorpayOrderId,
+          razorpayPaymentId: details.razorpayPaymentId,
+        };
+      });
+      writeJson(STORAGE_KEYS.orders, updated);
+      setOrdersState(updated);
+    },
+    []
+  );
 
   const clearTableOrders = useCallback((tableNumber: number) => {
     const current = readJson(STORAGE_KEYS.orders, [] as Order[]);
@@ -378,6 +410,7 @@ export function useServeSmartStore() {
     updateOrderStatus,
     selectOrderPayment,
     markCashPaid,
+    confirmRazorpayPayment,
     clearTableOrders,
     submitReview,
     syncFromStorage: syncAll,

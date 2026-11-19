@@ -258,6 +258,27 @@ export function KitchenView({
                       </div>
                     </div>
 
+                    {order.paymentStatus === 'paid' && (
+                      <div className="px-5 py-2 bg-emerald-500/10 border-b border-emerald-500/20 flex items-center justify-between gap-2 text-xs">
+                        <span className="inline-flex items-center gap-1.5 font-semibold text-emerald-300">
+                          <CheckCircle2 className="w-3.5 h-3.5" />
+                          {order.razorpayPaymentId
+                            ? 'Paid · Razorpay'
+                            : order.paymentMethod === 'upi'
+                              ? 'Paid · UPI'
+                              : 'Paid · Cash'}
+                        </span>
+                        {order.razorpayPaymentId && (
+                          <span
+                            data-testid="kitchen-razorpay-id"
+                            className="font-mono text-[11px] text-emerald-200 truncate"
+                          >
+                            {order.razorpayPaymentId}
+                          </span>
+                        )}
+                      </div>
+                    )}
+
                     {/* Ticket Line Items */}
                     <ul className="p-5 divide-y divide-[#1E293B]">
                       {order.items.map((item) => (

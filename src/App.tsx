@@ -27,6 +27,7 @@ export default function App() {
     updateOrderStatus,
     selectOrderPayment,
     markCashPaid,
+    confirmRazorpayPayment,
     clearTableOrders,
     submitReview,
     syncFromStorage,
@@ -128,7 +129,7 @@ export default function App() {
           onChangeTable={handleChangeTableInPlace}
           onPlaceOrder={placeOrder}
           onSelectPayment={selectOrderPayment}
-          onConfirmPayment={markCashPaid}
+          onConfirmRazorpayPayment={confirmRazorpayPayment}
           onSubmitReview={submitReview}
           onSyncFromStorage={syncFromStorage}
           customerOnlyMode
@@ -173,7 +174,7 @@ export default function App() {
                 onChangeTable={handleChangeTableInPlace}
                 onPlaceOrder={placeOrder}
                 onSelectPayment={selectOrderPayment}
-                onConfirmPayment={markCashPaid}
+                onConfirmRazorpayPayment={confirmRazorpayPayment}
                 onSubmitReview={submitReview}
                 onSyncFromStorage={syncFromStorage}
                 embedded
@@ -213,7 +214,7 @@ export default function App() {
               onChangeTable={handleChangeTableInPlace}
               onPlaceOrder={placeOrder}
               onSelectPayment={selectOrderPayment}
-              onConfirmPayment={markCashPaid}
+              onConfirmRazorpayPayment={confirmRazorpayPayment}
               onSubmitReview={submitReview}
               onSyncFromStorage={syncFromStorage}
             />

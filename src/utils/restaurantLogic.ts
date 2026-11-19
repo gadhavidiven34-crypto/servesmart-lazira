@@ -222,6 +222,30 @@ export function calculateCartSummary(
   };
 }
 
+export type UpiAppId = 'gpay' | 'phonepe' | 'paytm';
+
+const UPI_APP_PACKAGES: Record<UpiAppId, string> = {
+  gpay: 'com.google.android.apps.nbu.paisa.user',
+  phonepe: 'com.phonepe.app',
+  paytm: 'net.one97.paytm',
+};
+
+export function buildAppUpiUri(
+  app: UpiAppId,
+  upiId: string,
+  restaurantName: string,
+  amount: number
+): string {
+  const cleanUpi = upiId.trim();
+  const encodedName = encodeURIComponent(restaurantName.trim());
+  const formattedAmount = Number.isInteger(amount)
+    ? String(amount)
+    : amount.toFixed(2);
+  const query = `pa=${cleanUpi}&pn=${encodedName}&am=${formattedAmount}&cu=INR`;
+  const pkg = UPI_APP_PACKAGES[app];
+  return `intent://pay?${query}#Intent;scheme=upi;package=${pkg};end`;
+}
+
 export function buildUpiUri(
   upiId: string,
   restaurantName: string,

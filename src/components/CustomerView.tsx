@@ -1,32 +1,36 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
+  AlertCircle,
   CheckCircle2,
   ChefHat,
   Clock,
-  Copy,
   CreditCard,
   History,
   Loader2,
   Minus,
   Plus,
   Receipt,
+  ShieldCheck,
   ShoppingBag,
-  Smartphone,
   Star,
   Utensils,
   Wallet,
 } from 'lucide-react';
 import type { MenuItem, Order, RestaurantSettings } from '../types/restaurant';
 import {
-  buildUpiUri,
   calculateCartSummary,
   computeRemainingSeconds,
   formatCountdown,
   formatCurrency,
   getTablePaidOrderHistory,
 } from '../utils/restaurantLogic';
+import {
+  buildRazorpayCheckoutOptions,
+  requestRazorpayOrder,
+  verifyRazorpayPayment,
+} from '../utils/razorpay';
+import { playPaymentConfirmationSound } from '../utils/sound';
 import { BROADCAST_CHANNEL_NAME, STORAGE_KEYS } from '../utils/storage';
-import { QrCodeDisplay } from './QrCodeDisplay';
 
 interface CustomerViewProps {
   tableNumber: number;
@@ -41,7 +45,10 @@ interface CustomerViewProps {
     estimatedPrepMins: number
   ) => Order;
   onSelectPayment: (orderId: string, method: 'upi' | 'cash') => void;
-  onConfirmPayment: (orderId: string) => void;
+  onConfirmRazorpayPayment: (
+    orderId: string,
+    details: { razorpayOrderId: string; razorpayPaymentId: string }
+  ) => void;
   onSubmitReview: (
     orderId: string,
     tableNumber: number,
@@ -110,7 +117,7 @@ export function CustomerView({
   onChangeTable,
   onPlaceOrder,
   onSelectPayment,
-  onConfirmPayment,
+  onConfirmRazorpayPayment,
   onSubmitReview,
   onSyncFromStorage,
   embedded = false,
@@ -121,7 +128,6 @@ export function CustomerView({
   const [trackedOrderId, setTrackedOrderId] = useState<string | null>(null);
   const [startingNewOrder, setStartingNewOrder] = useState(false);
   const [nowMs, setNowMs] = useState(() => Date.now());
-  const [copiedUpi, setCopiedUpi] = useState(false);
   const [rating, setRating] = useState<number>(5);
   const [reviewComment, setReviewComment] = useState('');
   const [reviewError, setReviewError] = useState('');
@@ -238,16 +244,6 @@ export function CustomerView({
     setActiveTab('order');
     setCart({});
     window.scrollTo({ top: 0, behavior: 'auto' });
-  };
-
-  const handleCopyUpi = async () => {
-    try {
-      await navigator.clipboard.writeText(settings.upiId);
-      setCopiedUpi(true);
-      window.setTimeout(() => setCopiedUpi(false), 2000);
-    } catch {
-      // Clipboard blocked in headless environments
-    }
   };
 
   const handleReviewSubmit = (e: React.FormEvent) => {
@@ -446,13 +442,21 @@ export function CustomerView({
                             order.paidAt ?? order.createdAt
                           ).toLocaleString()}
                         </p>
+                        {order.razorpayPaymentId && (
+                          <p className="font-mono text-[11px] text-emerald-700 mt-0.5">
+                            Razorpay ID: {order.razorpayPaymentId}
+                          </p>
+                        )}
                       </div>
 
                       <div className="flex items-center gap-2.5 flex-wrap">
                         <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-emerald-50 border border-emerald-200 text-xs font-semibold text-emerald-700">
                           <CheckCircle2 className="w-3.5 h-3.5" />
-                          Paid via{' '}
-                          {order.paymentMethod === 'upi' ? 'UPI' : 'Cash'}
+                          {order.razorpayPaymentId
+                            ? 'Paid via Razorpay UPI'
+                            : order.paymentMethod === 'upi'
+                              ? 'Paid via UPI'
+                              : 'Paid via Cash'}
                         </span>
                         <span className="text-xs font-medium text-[#475467]">
                           {order.status === 'completed'
@@ -504,15 +508,15 @@ export function CustomerView({
             order={activeTableOrder}
             settings={settings}
             nowMs={nowMs}
-            copiedUpi={copiedUpi}
             rating={rating}
             reviewComment={reviewComment}
             reviewError={reviewError}
-            onCopyUpi={handleCopyUpi}
             onSelectPayment={(method) =>
               onSelectPayment(activeTableOrder.id, method)
             }
-            onConfirmPayment={() => onConfirmPayment(activeTableOrder.id)}
+            onConfirmRazorpayPayment={(details) =>
+              onConfirmRazorpayPayment(activeTableOrder.id, details)
+            }
             onChangeRating={setRating}
             onChangeComment={setReviewComment}
             onSubmitReview={handleReviewSubmit}
@@ -679,13 +683,14 @@ interface LiveOrderTrackerProps {
   order: Order;
   settings: RestaurantSettings;
   nowMs: number;
-  copiedUpi: boolean;
   rating: number;
   reviewComment: string;
   reviewError: string;
-  onCopyUpi: () => void;
   onSelectPayment: (method: 'upi' | 'cash') => void;
-  onConfirmPayment: () => void;
+  onConfirmRazorpayPayment: (details: {
+    razorpayOrderId: string;
+    razorpayPaymentId: string;
+  }) => void;
   onChangeRating: (rating: number) => void;
   onChangeComment: (comment: string) => void;
   onSubmitReview: (e: React.FormEvent) => void;
@@ -696,25 +701,101 @@ function LiveOrderTracker({
   order,
   settings,
   nowMs,
-  copiedUpi,
   rating,
   reviewComment,
   reviewError,
-  onCopyUpi,
   onSelectPayment,
-  onConfirmPayment,
+  onConfirmRazorpayPayment,
   onChangeRating,
   onChangeComment,
   onSubmitReview,
   onStartNewOrder,
 }: LiveOrderTrackerProps) {
+  const [checkoutStage, setCheckoutStage] = useState<
+    'idle' | 'creating_order' | 'checkout_open' | 'verifying'
+  >('idle');
+  const [paymentError, setPaymentError] = useState<string | null>(null);
+
   const remainingSecs = computeRemainingSeconds(order, nowMs);
   const formattedRemaining = formatCountdown(remainingSecs);
-  const upiUri = buildUpiUri(
-    settings.upiId,
-    settings.restaurantName,
-    order.totalAmount
-  );
+
+  const handlePayOnlineRazorpay = async () => {
+    if (checkoutStage !== 'idle') return;
+    setPaymentError(null);
+    setCheckoutStage('creating_order');
+
+    try {
+      const orderData = await requestRazorpayOrder(
+        order.totalAmount,
+        order.orderNumber
+      );
+
+      if (typeof window.Razorpay !== 'function') {
+        throw new Error(
+          'Razorpay Checkout failed to load. Please refresh the page and try again.'
+        );
+      }
+
+      const options = buildRazorpayCheckoutOptions({
+        keyId: orderData.keyId,
+        orderId: orderData.orderId,
+        amountPaise: orderData.amount,
+        currency: orderData.currency,
+        restaurantName: settings.restaurantName,
+        orderNumber: order.orderNumber,
+        tableNumber: order.tableNumber,
+        onDismiss: () => {
+          setCheckoutStage((prev) => (prev === 'verifying' ? prev : 'idle'));
+        },
+        onSuccess: async (response) => {
+          setCheckoutStage('verifying');
+          setPaymentError(null);
+          try {
+            const verification = await verifyRazorpayPayment({
+              razorpay_order_id: response.razorpay_order_id,
+              razorpay_payment_id: response.razorpay_payment_id,
+              razorpay_signature: response.razorpay_signature,
+            });
+
+            if (verification.verified) {
+              playPaymentConfirmationSound();
+              onConfirmRazorpayPayment({
+                razorpayOrderId: response.razorpay_order_id,
+                razorpayPaymentId: response.razorpay_payment_id,
+              });
+              setCheckoutStage('idle');
+            }
+          } catch (verifyErr) {
+            setPaymentError(
+              verifyErr instanceof Error
+                ? verifyErr.message
+                : 'Payment verification failed. Please contact reception.'
+            );
+            setCheckoutStage('idle');
+          }
+        },
+      });
+
+      const rzp = new window.Razorpay(options);
+      rzp.on?.('payment.failed', (failure) => {
+        setPaymentError(
+          failure?.error?.description ||
+            'Payment was not completed. Please try again.'
+        );
+        setCheckoutStage('idle');
+      });
+
+      setCheckoutStage('checkout_open');
+      rzp.open();
+    } catch (err) {
+      setPaymentError(
+        err instanceof Error
+          ? err.message
+          : 'Unable to start Razorpay Checkout. Please try again.'
+      );
+      setCheckoutStage('idle');
+    }
+  };
 
   const steps = [
     { key: 'received', label: 'Order Received' },
@@ -728,8 +809,6 @@ function LiveOrderTracker({
       : order.status === 'preparing'
         ? 1
         : 0;
-
-  const hasChosenPayment = order.paymentMethod !== null;
 
   return (
     <div className="max-w-3xl mx-auto space-y-6">
@@ -846,159 +925,165 @@ function LiveOrderTracker({
       </section>
 
       {/* Payment OR Post-Payment Confirmation & Review */}
-      {order.paymentStatus !== 'paid' && !hasChosenPayment ? (
-        <section className="bg-white border border-[#E4E7EC] rounded-xl p-5 sm:p-6 space-y-6">
-          <div className="space-y-4">
-            <div>
-              <h3 className="font-display text-lg font-bold text-[#101828]">
-                Complete Payment — {formatCurrency(order.totalAmount)}
-              </h3>
-              <p className="text-sm text-[#475467] mt-1">
-                Tap below to pay directly in your installed UPI app with the
-                exact bill amount pre-filled, or choose Cash at Counter.
-              </p>
+      {order.paymentStatus !== 'paid' && order.paymentMethod !== 'cash' ? (
+        <section className="bg-white border border-[#E4E7EC] rounded-xl p-5 sm:p-6 space-y-5">
+          <div>
+            <h3 className="font-display text-lg font-bold text-[#101828]">
+              Complete Payment — {formatCurrency(order.totalAmount)}
+            </h3>
+            <p className="text-sm text-[#475467] mt-1">
+              Pay instantly via Google Pay, PhonePe, or Paytm with automatic
+              Razorpay verification — no manual confirmation required.
+            </p>
+          </div>
+
+          {paymentError && (
+            <div
+              role="alert"
+              data-testid="razorpay-error"
+              className="p-3.5 rounded-xl bg-red-50 border border-red-200 text-red-800 text-xs sm:text-sm flex items-start gap-2.5"
+            >
+              <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+              <span>{paymentError}</span>
+            </div>
+          )}
+
+          <div className="space-y-3">
+            <button
+              type="button"
+              data-testid="razorpay-pay-button"
+              disabled={checkoutStage !== 'idle'}
+              onClick={() => void handlePayOnlineRazorpay()}
+              className="w-full min-h-[56px] px-4 sm:px-5 py-3.5 rounded-xl bg-emerald-700 hover:bg-emerald-800 disabled:bg-emerald-800/80 text-white text-[13px] sm:text-base font-bold flex items-center justify-between gap-2.5 cursor-pointer disabled:cursor-wait transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600"
+            >
+              <span className="flex items-center gap-2 text-left leading-snug">
+                {checkoutStage === 'idle' ? (
+                  <ShieldCheck className="w-4 h-4 sm:w-5 sm:h-5 text-emerald-200 shrink-0" />
+                ) : (
+                  <Loader2
+                    className="w-4 h-4 sm:w-5 sm:h-5 text-emerald-100 animate-spin shrink-0"
+                    aria-hidden="true"
+                  />
+                )}
+                <span>
+                  {checkoutStage === 'creating_order'
+                    ? 'Starting Secure Checkout...'
+                    : checkoutStage === 'checkout_open'
+                      ? 'Complete Payment in Razorpay...'
+                      : checkoutStage === 'verifying'
+                        ? 'Verifying Payment Signature...'
+                        : 'Pay Online (GPay / PhonePe / Paytm)'}
+                </span>
+              </span>
+              <span className="font-mono text-sm font-bold text-emerald-100 tabular-nums shrink-0">
+                {formatCurrency(order.totalAmount)}
+              </span>
+            </button>
+
+            <div className="flex items-center justify-center gap-2 flex-wrap text-xs text-[#475467]">
+              <span className="font-semibold text-[#101828]">Google Pay</span>
+              <span aria-hidden="true">·</span>
+              <span className="font-semibold text-[#5F259F]">PhonePe</span>
+              <span aria-hidden="true">·</span>
+              <span className="font-semibold text-[#002970]">Paytm</span>
+              <span aria-hidden="true">·</span>
+              <span>Auto-Verified via Razorpay</span>
             </div>
 
-            {/* Primary Mobile Direct UPI App Intent Anchor */}
-            <div className="space-y-3">
-              <a
-                href={upiUri}
-                onClick={() => onSelectPayment('upi')}
-                className="w-full min-h-[52px] px-5 py-3 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white text-sm sm:text-base font-bold inline-flex items-center justify-center gap-2.5 cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600"
-              >
-                <Smartphone className="w-5 h-5 shrink-0" />
-                <span>
-                  Pay {formatCurrency(order.totalAmount)} via GPay / PhonePe /
-                  Paytm
-                </span>
-              </a>
-
+            <div className="pt-2 border-t border-[#F2F4F7]">
               <button
                 type="button"
+                disabled={checkoutStage !== 'idle'}
                 onClick={() => onSelectPayment('cash')}
-                className="w-full h-11 px-4 rounded-lg bg-white hover:bg-[#F9FAFB] text-[#101828] border border-[#D0D5DD] text-sm font-semibold inline-flex items-center justify-center gap-2 cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600"
+                className="w-full h-11 px-4 rounded-xl bg-white hover:bg-[#F9FAFB] text-[#344054] border border-[#D0D5DD] text-sm font-semibold inline-flex items-center justify-center gap-2 cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600"
               >
                 <Wallet className="w-4 h-4" />
                 Pay Cash at Counter
               </button>
-            </div>
-
-            <div className="flex items-center justify-between gap-2 px-3 py-2 bg-[#F8F9FA] border border-[#E4E7EC] rounded-lg">
-              <div className="min-w-0">
-                <span className="text-[11px] font-medium text-[#475467] block">
-                  Merchant UPI ID
-                </span>
-                <span className="font-mono text-xs sm:text-sm font-semibold text-[#101828] truncate block">
-                  {settings.upiId}
-                </span>
-              </div>
-              <button
-                type="button"
-                onClick={onCopyUpi}
-                className="px-2.5 py-1.5 text-xs font-medium text-[#344054] bg-white border border-[#D0D5DD] rounded-md hover:bg-[#F9FAFB] inline-flex items-center gap-1.5 cursor-pointer shrink-0"
-              >
-                <Copy className="w-3.5 h-3.5" />
-                {copiedUpi ? 'Copied' : 'Copy'}
-              </button>
-            </div>
-          </div>
-
-          {/* Secondary Scannable QR Code Option */}
-          <div className="pt-5 border-t border-[#F2F4F7] flex flex-col sm:flex-row items-center gap-5">
-            <QrCodeDisplay
-              value={upiUri}
-              size={148}
-              alt={`UPI QR Code for ${formatCurrency(order.totalAmount)}`}
-              className="shrink-0"
-            />
-            <div className="text-center sm:text-left">
-              <p className="text-sm font-semibold text-[#101828]">
-                Or Scan QR Code from Another Device
-              </p>
-              <p className="text-xs text-[#475467] mt-1">
-                If someone else is paying on another phone, they can scan this
-                UPI QR code using GPay, PhonePe, or Paytm for{' '}
-                <span className="font-mono font-semibold text-[#101828]">
-                  {formatCurrency(order.totalAmount)}
-                </span>
-                .
-              </p>
             </div>
           </div>
         </section>
       ) : (
         <div className="space-y-6">
           {order.paymentStatus === 'paid' ? (
-            /* Celebratory Confirmation Card */
-            <section className="bg-emerald-50 border border-emerald-200 rounded-xl p-6 text-center">
-              <div className="w-11 h-11 rounded-full bg-emerald-700 text-white flex items-center justify-center mx-auto mb-3">
-                <CheckCircle2 className="w-6 h-6" />
+            /* Green Payment Confirmed Receipt Screen */
+            <section
+              data-testid="payment-confirmed-receipt"
+              className="bg-emerald-50 border border-emerald-200 rounded-xl p-6 text-center space-y-4"
+            >
+              <div>
+                <div className="w-12 h-12 rounded-full bg-emerald-700 text-white flex items-center justify-center mx-auto mb-3">
+                  <CheckCircle2 className="w-6 h-6" />
+                </div>
+                <span className="inline-block text-[11px] font-bold uppercase tracking-wider text-emerald-800 mb-1">
+                  Payment Confirmed
+                </span>
+                <h3 className="font-display text-xl font-bold text-emerald-950">
+                  Your Payment is Successful! Thank You &amp; Visit Again 🙏
+                </h3>
+                <p className="text-sm text-emerald-800 mt-1.5">
+                  {order.razorpayPaymentId
+                    ? `Auto-verified online payment of ${formatCurrency(order.totalAmount)} confirmed for Table ${order.tableNumber}.`
+                    : order.paymentMethod === 'upi'
+                      ? `UPI payment of ${formatCurrency(order.totalAmount)} confirmed for Table ${order.tableNumber}.`
+                      : `Cash payment of ${formatCurrency(order.totalAmount)} confirmed at reception for Table ${order.tableNumber}.`}
+                </p>
               </div>
-              <h3 className="font-display text-xl font-bold text-emerald-950">
-                Your Payment is Successful! Thank You &amp; Visit Again 🙏
-              </h3>
-              <p className="text-sm text-emerald-800 mt-1.5">
-                {order.paymentMethod === 'upi'
-                  ? `UPI payment of ${formatCurrency(order.totalAmount)} confirmed for Table ${order.tableNumber}.`
-                  : `Cash payment of ${formatCurrency(order.totalAmount)} confirmed at reception for Table ${order.tableNumber}.`}
-              </p>
-              <div className="mt-4 flex items-center justify-center gap-3 flex-wrap">
-                <span className="inline-flex items-center gap-1.5 text-xs font-medium text-emerald-900">
-                  <CreditCard className="w-3.5 h-3.5" />
-                  Method: {order.paymentMethod === 'upi' ? 'UPI' : 'Cash'}
-                </span>
-                <span aria-hidden="true" className="text-emerald-400">
-                  ·
-                </span>
+
+              <div className="max-w-md mx-auto bg-white/90 border border-emerald-200 rounded-lg p-3.5 text-left text-xs space-y-2">
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-[#475467] whitespace-nowrap shrink-0">
+                    Order Receipt
+                  </span>
+                  <span className="font-mono font-semibold text-[#101828] text-right">
+                    {order.orderNumber} · Table {order.tableNumber}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-[#475467] whitespace-nowrap shrink-0">
+                    Amount Paid
+                  </span>
+                  <span className="font-mono font-bold text-emerald-800 tabular-nums text-right">
+                    {formatCurrency(order.totalAmount)}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-[#475467] whitespace-nowrap shrink-0">
+                    Method
+                  </span>
+                  <span className="inline-flex items-center gap-1 font-semibold text-[#101828] text-right">
+                    <CreditCard className="w-3.5 h-3.5 text-emerald-700 shrink-0" />
+                    <span>
+                      {order.razorpayPaymentId
+                        ? 'Razorpay UPI (Verified)'
+                        : order.paymentMethod === 'upi'
+                          ? 'UPI'
+                          : 'Cash'}
+                    </span>
+                  </span>
+                </div>
+                {order.razorpayPaymentId && (
+                  <div className="flex items-center justify-between gap-3 pt-2 border-t border-emerald-100">
+                    <span className="text-[#475467] whitespace-nowrap shrink-0">
+                      Payment ID
+                    </span>
+                    <span
+                      data-testid="receipt-payment-id"
+                      className="font-mono font-semibold text-emerald-900 select-all text-right break-all"
+                    >
+                      {order.razorpayPaymentId}
+                    </span>
+                  </div>
+                )}
+              </div>
+
+              <div className="pt-1 flex items-center justify-center gap-3 flex-wrap">
                 <button
                   type="button"
                   onClick={onStartNewOrder}
                   className="text-xs font-semibold text-emerald-900 underline underline-offset-4 hover:text-emerald-700 cursor-pointer"
                 >
                   Place Another Order
-                </button>
-              </div>
-            </section>
-          ) : order.paymentMethod === 'upi' ? (
-            /* UPI Payment Waiting for Reception Confirmation (no manual customer confirm button) */
-            <section
-              data-testid="upi-pending-banner"
-              className="bg-amber-50 border border-amber-300 rounded-xl p-6 text-center space-y-4"
-            >
-              <div>
-                <div className="w-11 h-11 rounded-full bg-amber-600 text-white flex items-center justify-center mx-auto mb-3">
-                  <Loader2 className="w-5 h-5 animate-spin" aria-hidden="true" />
-                </div>
-                <span className="inline-block text-[11px] font-semibold uppercase tracking-wider text-amber-800 mb-1">
-                  UPI · Waiting for Confirmation
-                </span>
-                <h3 className="font-display text-xl font-bold text-amber-950">
-                  Waiting for Reception to confirm your UPI payment...
-                </h3>
-                <p className="text-sm text-amber-900 mt-1.5">
-                  Complete the{' '}
-                  <span className="font-mono font-bold">
-                    {formatCurrency(order.totalAmount)}
-                  </span>{' '}
-                  payment in your UPI app ({settings.upiId}). This page updates
-                  automatically the moment Reception confirms receipt.
-                </p>
-              </div>
-
-              <div className="flex flex-col sm:flex-row items-center justify-center gap-3">
-                <a
-                  href={upiUri}
-                  className="h-10 px-4 rounded-lg bg-[#101828] hover:bg-[#1D2939] text-white text-xs font-semibold inline-flex items-center justify-center gap-2 cursor-pointer"
-                >
-                  <Smartphone className="w-4 h-4" />
-                  Open UPI App Again ({formatCurrency(order.totalAmount)})
-                </a>
-                <button
-                  type="button"
-                  onClick={() => onSelectPayment('cash')}
-                  className="h-10 px-4 rounded-lg border border-amber-300 bg-white hover:bg-amber-100/50 text-amber-950 text-xs font-semibold cursor-pointer"
-                >
-                  Switch to Cash at Counter
                 </button>
               </div>
             </section>
